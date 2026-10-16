@@ -89,17 +89,14 @@ def main():
                     compendium_data.append(get_file_metadata(found_path))
                     processed_paths.add(found_path)
         except subprocess.CalledProcessError as e:
-            sys.stderr.write(f"Error searching for pattern {pattern} in {base_dir}: {e.stderr}}
-")
+            sys.stderr.write(f"Error searching for pattern {pattern} in {base_dir}: {e.stderr}\n")
         except Exception as e:
-            sys.stderr.write(f"An unexpected error occurred during pattern search ({pattern} in {base_dir}): {str(e)}
-")
+            sys.stderr.write(f"An unexpected error occurred during pattern search ({pattern} in {base_dir}): {str(e)}\n")
 
     output_file_path = os.path.join("/data/data/com.termux/files/home/.gemini/tmp/home", "compendium_output.json")
     with open(output_file_path, "w", encoding="utf-8") as f:
         json.dump(compendium_data, f, indent=2)
-    sys.stdout.write(f"Compendium generated successfully at: {output_file_path}
-")
+    sys.stdout.write(f"Compendium generated successfully at: {output_file_path}\n")
 
 if __name__ == "__main__":
     main()
