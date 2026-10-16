@@ -89,7 +89,7 @@ def main():
                     compendium_data.append(get_file_metadata(found_path))
                     processed_paths.add(found_path)
         except subprocess.CalledProcessError as e:
-            sys.stderr.write(f"Error searching for pattern {pattern} in {base_dir}: {e.stderr}
+            sys.stderr.write(f"Error searching for pattern {pattern} in {base_dir}: {e.stderr}}
 ")
         except Exception as e:
             sys.stderr.write(f"An unexpected error occurred during pattern search ({pattern} in {base_dir}): {str(e)}

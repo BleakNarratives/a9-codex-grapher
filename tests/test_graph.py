@@ -237,7 +237,11 @@ def test_edges_reference_existing_nodes(db_path):
         ).fetchone()[0]
         assert orphans == 0
         n_edges = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-        assert n_edges == len(NODE_PATHS) - 1  # every node but the roots has a parent
+        # every non-root node whose parent is present gets exactly one CONTAINS edge
+        all_paths = {p for p, _, _ in NODE_PATHS}
+        expected = sum(1 for p in all_paths
+                       if p.rsplit("/", 1)[0] in all_paths and p.rsplit("/", 1)[0] != p)
+        assert n_edges == expected
     finally:
         conn.close()
 
@@ -380,7 +384,7 @@ def test_stale_index_detected_and_rebuild_fixes_it(indexed_db):
     conn.commit()
     conn.close()
 
-    with pytest.raises(fts_indexer.StaleIndexError):
+    with pytest.raises(fts_indexer.RebuildRequiredError):
         fts_indexer.build_index(indexed_db, log=lambda *_a, **_k: None)
 
     summary = fts_indexer.build_index(indexed_db, rebuild_flag=True,
@@ -412,6 +416,100 @@ def test_cli_missing_db_exits_2(tmp_path, capsys):
     rc = fts_indexer.main(["--db", str(tmp_path / "nope.db"), "--quiet"])
     assert rc == 2
     assert "not found" in capsys.readouterr().err
+
+
+# ------------------------------------------- foreign (legacy) FTS schema
+#
+# The real artifact already carries an external-content, name-only nodes_fts
+# with sync triggers (not built by this script). The indexer must detect that
+# instead of silently clobbering or misreading it.
+
+LEGACY_FTS_DDL = [
+    """CREATE VIRTUAL TABLE nodes_fts USING fts5(
+        name, content='nodes', content_rowid='rowid', tokenize='unicode61')""",
+    """CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+        INSERT INTO nodes_fts(rowid, name) VALUES (new.rowid, COALESCE(new.name, ''));
+       END""",
+    """CREATE TRIGGER nodes_fts_delete AFTER DELETE ON nodes BEGIN
+        INSERT INTO nodes_fts(nodes_fts, rowid, name)
+        VALUES ('delete', old.rowid, COALESCE(old.name, ''));
+       END""",
+]
+
+
+@pytest.fixture()
+def legacy_db(db_path):
+    """Fixture DB with the foreign name-only external-content FTS + triggers."""
+    conn = sqlite3.connect(db_path)
+    for ddl in LEGACY_FTS_DDL:
+        conn.execute(ddl)
+    for rid, name in conn.execute("SELECT rowid, name FROM nodes"):
+        conn.execute("INSERT INTO nodes_fts(rowid, name) VALUES (?, ?)", (rid, name or ""))
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_legacy_schema_protected_even_when_counts_match(legacy_db):
+    # Legacy fixture indexes every node, so counts match — the foreign schema
+    # must still block an in-place build instead of being misread or clobbered.
+    conn = sqlite3.connect(legacy_db)
+    try:
+        assert fts_indexer.fts_columns(conn) == ("name",)
+    finally:
+        conn.close()
+    with pytest.raises(fts_indexer.RebuildRequiredError):
+        fts_indexer.build_index(legacy_db, log=lambda *_a, **_k: None)
+
+
+def test_legacy_schema_blocks_build_without_rebuild(legacy_db):
+    conn = sqlite3.connect(legacy_db)
+    conn.execute(
+        "INSERT INTO nodes (id, name, type, size_bytes, mtime, label)"
+        " VALUES (?, 'late.md', 'file', 1, '2026-10-15T00:00:00', 'File')",
+        (f"{TERMUX}/late.md",),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(fts_indexer.RebuildRequiredError):
+        fts_indexer.build_index(legacy_db, log=lambda *_a, **_k: None)
+
+    rc = fts_indexer.main(["--db", legacy_db, "--quiet"])
+    assert rc == 3
+
+
+def test_legacy_rebuild_replaces_schema_and_drops_triggers(legacy_db):
+    summary = fts_indexer.build_index(legacy_db, rebuild_flag=True,
+                                      log=lambda *_a, **_k: None)
+    assert summary["indexed"] == len(NODE_PATHS)
+
+    conn = fts_indexer.connect(legacy_db, readonly=True)
+    try:
+        assert fts_indexer.fts_columns(conn) == fts_indexer.EXPECTED_FTS_COLUMNS
+        triggers = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger'")]
+        assert triggers == [], f"legacy triggers should be gone, found {triggers}"
+        rows = fts_indexer.search(conn, "GRAVEYARD")
+        assert any(r["path"].endswith("/Zips/GRAVEYARD.zip") for r in rows)
+        # path column now searchable
+        assert fts_indexer.search(conn, '"root_2026"')
+    finally:
+        conn.close()
+
+
+def test_dry_run_reports_foreign_schema(legacy_db):
+    summary = fts_indexer.build_index(legacy_db, dry_run=True,
+                                      log=lambda *_a, **_k: None)
+    assert "foreign-schema" in summary["action"]
+    conn = sqlite3.connect(legacy_db)
+    try:
+        assert fts_indexer.table_exists(conn, fts_indexer.FTS_TABLE)  # untouched
+        n_triggers = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0]
+        assert n_triggers == len(LEGACY_FTS_DDL) - 1  # two triggers, unchanged
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------- integration (optional)

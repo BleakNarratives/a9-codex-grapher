@@ -173,6 +173,9 @@ def rebuild(conn: sqlite3.Connection, batch_size: int = DEFAULT_BATCH,
     conn.execute("BEGIN")
     try:
         conn.execute(f"DROP TABLE IF EXISTS {FTS_TABLE}")
+        dropped = drop_fts_triggers(conn)
+        if dropped:
+            log(f"  -> dropped legacy sync triggers: {', '.join(dropped)}")
         ensure_fts(conn)
         total = populate_fts(conn, batch_size=batch_size, log=log)
         conn.execute("COMMIT")
@@ -183,12 +186,23 @@ def rebuild(conn: sqlite3.Connection, batch_size: int = DEFAULT_BATCH,
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int = 20):
-    """Run an FTS5 MATCH query; returns rows joined back to `nodes` by rowid."""
+    """Run an FTS5 MATCH query; returns rows joined back to `nodes` by rowid.
+
+    Schema-aware: snippet() targets the `path` column when this script's index
+    is present, falls back to `name` for foreign (e.g. name-only) FTS tables.
+    """
+    cols = fts_columns(conn)
+    if "path" in cols:
+        snippet_expr = f"snippet({FTS_TABLE}, 1, '[', ']', '…', 8)"
+    elif "name" in cols:
+        snippet_expr = f"snippet({FTS_TABLE}, 0, '[', ']', '…', 8)"
+    else:
+        snippet_expr = "NULL"
     sql = f"""
         SELECT n.rowid AS rowid, n.id AS path, n.name AS name, n.type AS type,
                n.size_bytes AS size_bytes,
                bm25({FTS_TABLE}) AS rank,
-               snippet({FTS_TABLE}, 1, '[', ']', '…', 8) AS path_snippet
+               {snippet_expr} AS path_snippet
         FROM {FTS_TABLE} f
         JOIN nodes n ON n.rowid = f.rowid
         WHERE {FTS_TABLE} MATCH ?
@@ -220,11 +234,18 @@ def build_index(
         n_nodes = count_nodes(conn)
         summary["nodes"] = n_nodes
         has_fts = table_exists(conn, FTS_TABLE)
+        cols = fts_columns(conn)
         n_fts = count_fts(conn) if has_fts else 0
 
         if dry_run:
             if not has_fts:
                 summary["action"] = f"would create {FTS_TABLE} and index {n_nodes:,} nodes"
+            elif cols != EXPECTED_FTS_COLUMNS:
+                summary["action"] = (
+                    f"would replace foreign-schema {FTS_TABLE} {cols} with "
+                    f"{EXPECTED_FTS_COLUMNS} and drop its sync triggers "
+                    f"({n_fts:,} rows -> {n_nodes:,})"
+                )
             elif rebuild_flag:
                 summary["action"] = f"would rebuild {FTS_TABLE} ({n_fts:,} rows -> {n_nodes:,})"
             elif n_fts == n_nodes:
@@ -233,11 +254,17 @@ def build_index(
                 summary["action"] = f"STALE ({n_fts:,} vs {n_nodes:,} rows); --rebuild required"
             return summary
 
+        if has_fts and cols != EXPECTED_FTS_COLUMNS and not rebuild_flag:
+            raise RebuildRequiredError(
+                f"existing {FTS_TABLE} has columns {cols} (foreign schema); "
+                f"rerun with --rebuild to replace it with {EXPECTED_FTS_COLUMNS}"
+            )
+
         if has_fts and not rebuild_flag:
             if n_fts == n_nodes:
                 summary["action"] = f"already up to date ({n_fts:,} rows)"
                 return summary
-            raise StaleIndexError(
+            raise RebuildRequiredError(
                 f"{FTS_TABLE} has {n_fts:,} rows but nodes has {n_nodes:,} "
                 f"— rerun with --rebuild"
             )
@@ -288,7 +315,7 @@ def main(argv=None) -> int:
             # build_index's progress callback passes file=; swallow it here
             log=lambda m, **_k: log(m),
         )
-    except StaleIndexError as exc:
+    except RebuildRequiredError as exc:
         print(f"[!] {exc}", file=sys.stderr)
         return 3
     except IndexerError as exc:
