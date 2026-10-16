@@ -11,10 +11,12 @@ current schema was read from `codex_graph.db` itself (`sqlite_master`), not assu
 |---|---|---|
 | `fast_comp.py` (= `02_fast_inode_ndjson.py`) | Streaming inode walker; `os.stat` per node, no hashing, prunes `SKIP_DIRS` | `~/a9_codex_fast.ndjson` (313,432 nodes) |
 | `export_ndjson_graph.py` (= `03_ndjson_to_neo4j_csv.py`) | NDJSON -> Neo4j-style CSVs with `CONTAINS` edges | `~/codex_nodes.csv`, `~/codex_edges.csv` |
-| `query_codex_graph.py` (= `04_graph_query_cli.py`) | Naive linear scan of nodes CSV by term/extension | stdout |
+| `csv_to_sqlite.py` | Atomically imports graph CSVs and builds SQLite/FTS5 indexes | `codex_graph.db` |
+| `query_codex_graph.py` | Materializes root/cluster summaries; performs indexed prefix and cluster queries (legacy CSV term search retained) | stdout and `roots`/`clusters` tables |
 | `diff_manifests.py` (= `05_cross_model_diff.py`) | Cross-model manifest comparison (counts, type breakdown) | stdout |
 | `generate_compendium.py` (= `01_gemini_cli_full_sha256.py`) | Full SHA256 pass, one `sha256sum` fork per file; hardcoded Termux paths | `compendium_output.json` |
 | `fts_indexer.py` (new) | Builds/rebuilds the FTS5 search index over `codex_graph.db` | `nodes_fts` in the DB |
+| `core_framework/adapters/graph_search.py` | Read-only CLI for FTS5 MATCH searches | stdout |
 
 Provenance bundles (`provenance/scripts|manifests|graphs/`) are frozen snapshots and are not
 edited; fixes land in the repo-root copies.
@@ -33,17 +35,22 @@ Observed contents: 313,432 nodes (278,690 files / 34,742 directories), 313,428 e
 node count matches `a9_codex_fast.ndjson` line-for-line. Root prefixes present:
 Termux home (232,617), RootBase (73,349), r26 (7,453), ChronoScouts (13).
 
-### Known gaps
+Root and cluster summaries are materialized explicitly with
+`python query_codex_graph.py index --device-id <stable-device-id>`. The generated
+`roots` and `clusters` tables store one set per device and snapshot; re-running
+the same device/snapshot replaces that set. By default, cluster queries show the
+latest ISO-8601 snapshot per device. Prefix reads use a range scan on the
+existing `nodes.id` primary-key index; a duplicate single-column path index is
+unnecessary.
 
-1. **No builder script.** Nothing in the repo creates `codex_graph.db` from the CSVs; the
-   DB is a git-ignored hand-built artifact. A `csv_to_sqlite.py` loader closes this gap and
-   makes the DB reproducible.
-2. **No path index.** Cluster/prefix queries rely on `LIKE '/root/%'` scans over 313k rows.
-3. **No full-text search.** `query_codex_graph.py` is an O(n) CSV scan.
-4. **No device provenance.** `id` paths are absolute Android paths; there is no record of
-   which device produced a snapshot or when.
-5. **Directories carry `size_bytes = 0`**, so "how big is this subtree" cannot be answered
+### Remaining gaps
+
+1. **Limited device provenance.** Root summaries record a supplied device ID and
+   snapshot time, but the node rows themselves are not namespaced by device/snapshot.
+2. **Directories carry `size_bytes = 0`**, so "how big is this subtree" cannot be answered
    without summing children at query time.
+3. **No automated multi-device merge.** CSV snapshots can be built into separate
+   databases, but identity, history, path mapping, and merging are not implemented.
 
 ## 2. Target schema (v2)
 
@@ -132,11 +139,13 @@ Unverified or rejected snapshots remain quarantined — they never become search
 
 ## 5. Testing strategy
 
-`tests/test_graph.py` (pytest):
+`python -m pytest -q` covers:
 
 - schema/connection checks against a deterministic fixture DB in `tmp_path` (never the
   live artifact);
-- cluster aggregation: ranking, counts, per-root totals, termux exclusion;
+- CSV import and atomic replacement behavior;
+- root/cluster aggregation, snapshot refresh, indexed prefix lookup, and CLI behavior;
+- cluster ranking, counts, per-root totals, termux exclusion;
 - FTS5: creation, rowid alignment, case/prefix/phrase/boolean matching, tokenizer
   folding, `type UNINDEXED` behavior, rebuild idempotency, dry-run safety;
 - one integration test against the real `codex_graph.db`, auto-skipped when the
@@ -144,15 +153,19 @@ Unverified or rejected snapshots remain quarantined — they never become search
 
 ## 6. Performance and resource notes
 
-- Cluster queries today scan ~81k rows under both roots via `LIKE`; the `idx_nodes_id_prefix`
-  index turns that into an index range scan once adopted by the query tooling.
+- Cluster materialization scans the indexed range under each configured root once per
+  snapshot; later cluster queries read the compact `clusters` table.
+- Prefix queries use SQLite's `nodes.id` primary-key range scan rather than a leading-wildcard
+  `LIKE` scan.
 - Indexing 313k rows into FTS5 is a single-transaction bulk insert (seconds, not minutes).
 - Building/rebuilding writes a rollback journal roughly the size of the touched pages:
   budget free disk ≈ DB size (200 MB headroom) before running against the live artifact.
 
 ## 7. Sequenced next steps
 
-1. `csv_to_sqlite.py` loader so the DB is reproducible from the CSVs. (not yet done)
-2. `roots`/`clusters` population + indexed prefix queries in `query_codex_graph.py`. (not yet done)
-3. Handoff digests implemented in `diff_manifests.py`. (not yet done)
-4. Snapshot merge tooling with `device_id` namespacing. (not yet done)
+1. Handoff digests implemented in `diff_manifests.py`. (**done** — `manifest_digest()`,
+   SHA256 over sorted `path\0size_bytes` lines, works on NDJSON/JSON/SQLite manifests;
+   `main()` prints per-manifest digests and pairwise MATCH/MISMATCH verdicts.)
+2. Snapshot merge tooling with `device_id` namespacing. (**done** — `merge_snapshots.py`:
+   digest verification with quarantine + `imports` audit, additive `device_id`/`snapshot_at`
+   columns, `roots` population, INSERT-OR-IGNORE merge, post-merge FTS rebuild, `--dry-run`.)
