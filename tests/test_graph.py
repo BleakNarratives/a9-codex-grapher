@@ -313,7 +313,8 @@ def test_fts_phrase_search(indexed_db):
 def test_fts_boolean_search(indexed_db):
     conn = fts_indexer.connect(indexed_db, readonly=True)
     try:
-        rows = fts_indexer.search(conn, "GRAVEYARD AND NOT Kindred")
+        # FTS5's NOT is binary ("a NOT b"), not "AND NOT"
+        rows = fts_indexer.search(conn, "GRAVEYARD NOT Kindred")
     finally:
         conn.close()
     assert rows, "boolean query returned nothing"

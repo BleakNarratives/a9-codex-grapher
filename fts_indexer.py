@@ -122,11 +122,20 @@ def fts_columns(conn: sqlite3.Connection) -> tuple:
     external-content, name-only index with sync triggers that shipped with the
     original 230 MB artifact); callers use this to detect that instead of
     assuming this script's schema.
+
+    Column presence is probed by SELECT rather than PRAGMA fts5_columns,
+    which returns no rows on some SQLite builds.
     """
     if not table_exists(conn, FTS_TABLE):
         return ()
-    rows = conn.execute(f"PRAGMA fts5_columns({FTS_TABLE})").fetchall()
-    return tuple(r[1] for r in rows if r[2] == 0)  # skip special columns
+    found = []
+    for col in EXPECTED_FTS_COLUMNS:
+        try:
+            conn.execute(f"SELECT {col} FROM {FTS_TABLE} LIMIT 0")
+            found.append(col)
+        except sqlite3.OperationalError:
+            continue
+    return tuple(found)
 
 
 def drop_fts_triggers(conn: sqlite3.Connection) -> list:
